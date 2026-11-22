@@ -10,11 +10,11 @@ Pi Black has three independently versioned compatibility surfaces:
 
 | Component | Compatible version |
 | --- | --- |
-| Pi package | Pi 0.84.1 or newer |
+| Pi package | Pi 1.6.0 or newer |
 | Standalone `pi-black` binary | Based on Pi 0.84.1 |
 | Claude Code protocol | 2.1.330 |
 
-The Pi package requires Pi 0.84.1 or newer, with no upper version limit. Future Pi releases are trusted until an incompatibility is identified; the package peer dependencies are `"*"` because Pi supplies its core packages at runtime.
+The Pi package requires Pi 1.6.0 or newer, with no upper version limit. Pi 1.x changed the provider context type and message continuation, so earlier releases are not supported by the package. Future Pi releases are trusted until an incompatibility is identified; the package peer dependencies are `"*"` because Pi supplies its core packages at runtime.
 
 ```sh
 pi install git:github.com/paoloanzn/pi-black
@@ -44,7 +44,7 @@ The package replaces only the built-in Anthropic provider implementation and onl
 
 ## Identity discovery
 
-No identity environment variables are required. When Claude Code state exists, Pi Black reads the installation ID and account UUID from `~/.claude.json` (or the location selected by `CLAUDE_CONFIG_DIR`) in memory and adds matching request metadata. It does not copy, print, or persist those values.
+No identity environment variables are required. The Pi extension reads the installation ID and account UUID from `~/.claude.json` (or the location selected by `CLAUDE_CONFIG_DIR`) in memory through `pi-black/node-identity` and adds matching request metadata. It does not copy, print, or persist those values. Hosts without a filesystem pass a bindings object instead.
 
 Current subscription routing also works when that optional metadata is unavailable, as demonstrated by the standalone Pi Black binary with no identity variables in its environment.
 
@@ -54,9 +54,11 @@ For Anthropic OAuth requests, Pi Black reproduces the version-specific SDK-CLI r
 
 - exact billing and Agent SDK system-block ordering;
 - the prompt-dependent `cc_version` suffix;
-- structure-aware `cch` calculation using seeded XXH64, matching the native
-  engine byte-for-byte (every `model` key emptied, `max_tokens`, `fallbacks`,
-  and `fallback_credit_token` dropped);
+- structure-aware `cch` calculation using seeded XXH64, matching native
+  2.1.330 captures byte-for-byte: `model` strings are emptied and numeric
+  `max_tokens`, array `fallbacks`, and string `fallback_credit_token` members
+  are dropped at any depth, while tool-schema properties of the same name
+  stay in the hash;
 - per-request `x-client-request-id` values;
 - Claude Code session headers;
 - automatically discovered identity metadata when available.
@@ -75,8 +77,10 @@ The package also exports the pieces without the Pi extension runtime, for hosts 
 | `pi-black/provider` | `wrapAnthropicProvider(provider, identity)` |
 | `pi-black/oauth` | `refreshAnthropicOAuth`, `anthropicOAuthForWorkers` |
 | `pi-black/protocol` | version constant, fingerprint, identity discovery, payload and `cch` patching |
+| `pi-black/node-identity` | `readClaudeCodeIdentityFromDisk`, `discoverClaudeCodeIdentityInNode` |
+| `pi-black/compatibility` | minimum supported Pi version |
 
-`anthropicOAuthForWorkers()` implements `refresh` and `toAuth` only. Interactive login needs a browser callback server, so a Worker must be seeded with an access token and, for durable use, a refresh token. Pass a plain bindings object to `discoverClaudeCodeIdentity` there: it reads those values first and only touches `~/.claude.json` in Node.
+`anthropicOAuthForWorkers()` implements `refresh` and `toAuth` only. Interactive login needs a browser callback server, so a Worker must be seeded with an access token and, for durable use, a refresh token. Pass a plain bindings object to `discoverClaudeCodeIdentity` there: it reads only the values it is given and never touches disk. Node hosts that want the Claude Code lookup import `pi-black/node-identity`.
 
 ## Verify the package
 

@@ -8,17 +8,21 @@ import type {
 } from "@earendil-works/pi-ai";
 import {
 	type ClaudeCodeIdentity,
-	discoverClaudeCodeIdentity,
 	isAnthropicOAuthToken,
 	mergeClaudeCodeOptions,
 } from "./claude-code-protocol.ts";
 
+/**
+ * Wraps Pi's Anthropic provider with Claude Code wire compatibility. Callers
+ * pass identity explicitly: the Worker passes bindings, the Pi extension passes
+ * {@link discoverClaudeCodeIdentityInNode}.
+ */
 export function wrapAnthropicProvider(
 	provider: Provider,
 	identity:
 		| ClaudeCodeIdentity
 		| undefined
-		| Promise<ClaudeCodeIdentity | undefined> = discoverClaudeCodeIdentity(),
+		| Promise<ClaudeCodeIdentity | undefined>,
 ): Provider {
 	if (provider.id !== "anthropic")
 		throw new Error(`Pi Black cannot wrap provider "${provider.id}"`);

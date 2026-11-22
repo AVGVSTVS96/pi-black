@@ -1,34 +1,49 @@
-From b47e4c6feb7a2ac380b0731b189457d459cb5760 Mon Sep 17 00:00:00 2001
+From b9192a2e0a4c7c22d3461504b3a4853974f083b8 Mon Sep 17 00:00:00 2001
 From: Pi OAuth Compatibility Maintainers <noreply@example.invalid>
 Date: Sat, 21 Nov 2026 21:51:21 -0800
 Subject: [PATCH] fix(ai): hash the native cch view byte-for-byte
 
 ---
- packages/ai/src/api/anthropic-claude-code.ts  | 157 +++++++++++++++++-
- .../ai/test/anthropic-claude-code.test.ts     |  40 +++++
- 2 files changed, 189 insertions(+), 8 deletions(-)
+ packages/ai/src/api/anthropic-claude-code.ts  | 258 +++++++++++++++++-
+ .../ai/test/anthropic-claude-code.test.ts     |  52 ++++
+ 2 files changed, 295 insertions(+), 15 deletions(-)
 
 diff --git a/packages/ai/src/api/anthropic-claude-code.ts b/packages/ai/src/api/anthropic-claude-code.ts
-index f1e6440b..1ee409f9 100644
+index f1e6440b..4b1c01c0 100644
 --- a/packages/ai/src/api/anthropic-claude-code.ts
 +++ b/packages/ai/src/api/anthropic-claude-code.ts
-@@ -116,6 +116,154 @@ export async function buildClaudeCodeBillingHeader(messages: Message[]): Promise
+@@ -91,10 +91,7 @@ function firstUserPrompt(messages: Message[]): string {
+ 	for (const message of messages) {
+ 		if (message.role !== "user") continue;
+ 		if (typeof message.content === "string") return message.content;
+-		return message.content
+-			.filter((block) => block.type === "text")
+-			.map((block) => block.text)
+-			.join("");
++		return message.content.find((block) => block.type === "text")?.text ?? "";
+ 	}
+ 	return "";
+ }
+@@ -116,6 +113,234 @@ export async function buildClaudeCodeBillingHeader(messages: Message[]): Promise
  	return `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.${fingerprint}; cc_entrypoint=${CLAUDE_CODE_ENTRYPOINT}; ${CCH_PLACEHOLDER};`;
  }
  
-+const CCH_EXCLUDED_KEYS = new Set([
-+	'"max_tokens"',
-+	'"fallbacks"',
-+	'"fallback_credit_token"',
-+]);
++const CCH_EXCLUDED_KEYS = new Set(['"max_tokens"', '"fallbacks"', '"fallback_credit_token"']);
 +
-+// Byte-level hash view matching the claude-code native engine (validated against
-+// claude-code 2.1.220-2.1.295 wire samples): every "model" key whose value is a
-+// string is emptied at any depth; max_tokens/fallbacks/fallback_credit_token
-+// members are dropped from the view with the native comma rules (a trailing run
-+// of two or more excluded members keeps the preceding comma). Everything else
-+// stays byte-identical, so unusual escapes or number spellings never change the
-+// hash.
++function isExcludedMember(key: string, firstValueCharacter: string): boolean {
++	if (!CCH_EXCLUDED_KEYS.has(key)) return false;
++	if (key === '"max_tokens"') return /[-0-9]/u.test(firstValueCharacter);
++	if (key === '"fallbacks"') return firstValueCharacter === "[";
++	return firstValueCharacter === '"';
++}
++
++// Byte-level hash view matching the claude-code native engine, validated against
++// 2.1.330 captures: every "model" string is emptied at any depth; numeric
++// max_tokens, array fallbacks and string fallback_credit_token members are
++// dropped with the native comma rules (a trailing run of two or more excluded
++// members keeps the preceding comma). Object-valued members of the same name,
++// such as tool schema properties, stay in the view. Everything else stays
++// byte-identical, so unusual escapes or number spellings never change the hash.
 +function cchHashInput(body: string): string {
 +	const edits: Array<{ start: number; end: number }> = [];
 +	let pos = 0;
@@ -47,7 +62,7 @@ index f1e6440b..1ee409f9 100644
 +		pos++;
 +		while (pos < body.length) {
 +			if (body[pos] === "\\") pos += 2;
-+			else if (body[pos] === "\"") {
++			else if (body[pos] === '"') {
 +				pos++;
 +				return [start, pos];
 +			} else pos++;
@@ -56,7 +71,10 @@ index f1e6440b..1ee409f9 100644
 +	};
 +	const parseValue = (collect: boolean): void => {
 +		skipWhitespace();
-+		if (body[pos] === "{") return parseObject(collect);
++		if (body[pos] === "{") {
++			parseObject(collect);
++			return;
++		}
 +		if (body[pos] === "[") {
 +			pos++;
 +			skipWhitespace();
@@ -69,14 +87,13 @@ index f1e6440b..1ee409f9 100644
 +				throw new Error("Claude Code cch input has invalid array syntax");
 +			}
 +		}
-+		if (body[pos] === "\"") {
++		if (body[pos] === '"') {
 +			parseString();
 +			return;
 +		}
 +		const start = pos;
 +		while (pos < body.length && !",}] \t\r\n".includes(body[pos])) pos++;
-+		if (pos === start)
-+			throw new Error("Claude Code cch input has an invalid JSON value");
++		if (pos === start) throw new Error("Claude Code cch input has an invalid JSON value");
 +	};
 +	function parseObject(collect: boolean): void {
 +		pos++;
@@ -95,12 +112,11 @@ index f1e6440b..1ee409f9 100644
 +			const memberStart = pos;
 +			const [keyStart, keyEnd] = parseString();
 +			skipWhitespace();
-+			if (!consume(":"))
-+				throw new Error("Claude Code cch input is missing an object colon");
++			if (!consume(":")) throw new Error("Claude Code cch input is missing an object colon");
 +			skipWhitespace();
 +			const key = body.slice(keyStart, keyEnd);
-+			const excluded = collect && CCH_EXCLUDED_KEYS.has(key);
-+			if (collect && key === '"model"' && body[pos] === "\"") {
++			const excluded = collect && isExcludedMember(key, body[pos] ?? "");
++			if (collect && key === '"model"' && body[pos] === '"') {
 +				const [valueStart, valueEnd] = parseString();
 +				edits.push({ start: valueStart + 1, end: valueEnd - 1 });
 +			} else parseValue(collect && !excluded);
@@ -119,8 +135,7 @@ index f1e6440b..1ee409f9 100644
 +				commaBefore = commaAfter;
 +				continue;
 +			}
-+			if (!consume("}"))
-+				throw new Error("Claude Code cch input is missing an object end");
++			if (!consume("}")) throw new Error("Claude Code cch input is missing an object end");
 +			break;
 +		}
 +		if (collect) {
@@ -131,30 +146,26 @@ index f1e6440b..1ee409f9 100644
 +					continue;
 +				}
 +				let last = index;
-+				while (last + 1 < members.length && members[last + 1].excluded)
-+					last++;
++				while (last + 1 < members.length && members[last + 1].excluded) last++;
 +				if (last + 1 < members.length)
 +					edits.push({
 +						start: members[index].start,
 +						end: members[last].commaAfter + 1,
 +					});
-+				else if (index > 0 && last > index)
-+					edits.push({ start: members[index].start, end: members[last].end });
++				else if (index > 0 && last > index) edits.push({ start: members[index].start, end: members[last].end });
 +				else if (index > 0)
 +					edits.push({
 +						start: members[index].commaBefore,
 +						end: members[last].end,
 +					});
-+				else
-+					edits.push({ start: members[index].start, end: members[last].end });
++				else edits.push({ start: members[index].start, end: members[last].end });
 +				index = last + 1;
 +			}
 +		}
 +	}
 +	parseValue(true);
 +	skipWhitespace();
-+	if (pos !== body.length)
-+		throw new Error("Claude Code cch input has trailing JSON data");
++	if (pos !== body.length) throw new Error("Claude Code cch input has trailing JSON data");
 +	edits.sort((a, b) => a.start - b.start);
 +	let normalized = "";
 +	let cursor = 0;
@@ -164,11 +175,96 @@ index f1e6440b..1ee409f9 100644
 +	}
 +	return normalized + body.slice(cursor);
 +}
++function systemBillingTextSpan(body: string): { start: number; end: number } | undefined {
++	let pos = 0;
++	let found: { start: number; end: number } | undefined;
++	const skipWhitespace = () => {
++		while (pos < body.length && " \t\r\n".includes(body[pos] ?? "")) pos++;
++	};
++	const readString = (): { start: number; end: number } => {
++		const start = pos;
++		if (body[pos] !== '"') throw new Error("Claude Code cch input expected an object key");
++		pos++;
++		while (pos < body.length) {
++			const ch = body[pos];
++			if (ch === "\\") {
++				pos += 2;
++				continue;
++			}
++			pos++;
++			if (ch === '"') return { start, end: pos };
++		}
++		throw new Error("Claude Code cch input has an unterminated string");
++	};
++	const readValue = (path: ReadonlyArray<string | number>): void => {
++		skipWhitespace();
++		const ch = body[pos];
++		if (ch === '"') {
++			const span = readString();
++			if (path.length === 3 && path[0] === "system" && path[1] === 0 && path[2] === "text") {
++				found = span;
++			}
++			return;
++		}
++		if (ch === "{") {
++			pos++;
++			skipWhitespace();
++			if (body[pos] === "}") {
++				pos++;
++				return;
++			}
++			for (;;) {
++				skipWhitespace();
++				const keySpan = readString();
++				const key = JSON.parse(body.slice(keySpan.start, keySpan.end)) as string;
++				skipWhitespace();
++				if (body[pos] !== ":") throw new Error("Claude Code cch input is missing an object colon");
++				pos++;
++				readValue([...path, key]);
++				skipWhitespace();
++				if (body[pos] === ",") {
++					pos++;
++					continue;
++				}
++				if (body[pos] !== "}") throw new Error("Claude Code cch input is missing an object end");
++				pos++;
++				return;
++			}
++		}
++		if (ch === "[") {
++			pos++;
++			skipWhitespace();
++			if (body[pos] === "]") {
++				pos++;
++				return;
++			}
++			for (let index = 0; ; index++) {
++				readValue([...path, index]);
++				skipWhitespace();
++				if (body[pos] === ",") {
++					pos++;
++					continue;
++				}
++				if (body[pos] !== "]") throw new Error("Claude Code cch input is missing an array end");
++				pos++;
++				return;
++			}
++		}
++		while (pos < body.length && !",}] \t\r\n".includes(body[pos] ?? "")) pos++;
++	};
++	readValue([]);
++	return found;
++}
++
  export function patchClaudeCodeCch(serializedBody: string): string {
  	let body: Record<string, unknown>;
  	try {
-@@ -137,14 +285,7 @@ export function patchClaudeCodeCch(serializedBody: string): string {
- 		if (/; cch=[0-9a-f]{5};$/u.test(billingBlock.text)) return serializedBody;
+@@ -134,20 +359,23 @@ export function patchClaudeCodeCch(serializedBody: string): string {
+ 		throw new Error("Claude Code OAuth request has an invalid billing system block");
+ 	}
+ 	if (!billingBlock.text.includes(CCH_PLACEHOLDER)) {
+-		if (/; cch=[0-9a-f]{5};$/u.test(billingBlock.text)) return serializedBody;
++		if (/(?:^|[; ])cch=[0-9a-f]{5}(?=[; ]|$)/u.test(billingBlock.text)) return serializedBody;
  		throw new Error("Claude Code OAuth request has an invalid cch billing value");
  	}
 -	if (typeof body.model !== "string" || !("max_tokens" in body)) {
@@ -181,22 +277,56 @@ index f1e6440b..1ee409f9 100644
 -	const hash = xxHash64(new TextEncoder().encode(JSON.stringify(normalized)), CCH_SEED);
 +	const hash = xxHash64(new TextEncoder().encode(cchHashInput(serializedBody)), CCH_SEED);
  	const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
- 	billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER, `cch=${cch}`);
- 	return JSON.stringify(body);
+-	billingBlock.text = billingBlock.text.replace(CCH_PLACEHOLDER, `cch=${cch}`);
+-	return JSON.stringify(body);
++	// Splice the value into the original bytes instead of re-serializing: the
++	// server hashes what it receives, so whitespace and escapes must survive.
++	const billingText = billingBlock.text;
++	const span = systemBillingTextSpan(serializedBody);
++	if (span === undefined) {
++		throw new Error("Claude Code OAuth request billing block is not in the serialized body");
++	}
++	if (JSON.parse(serializedBody.slice(span.start, span.end)) !== billingText) {
++		throw new Error("Claude Code OAuth request billing block is not in the serialized body");
++	}
++	const patchedText = billingText.replace(CCH_PLACEHOLDER, `cch=${cch}`);
++	return serializedBody.slice(0, span.start) + JSON.stringify(patchedText) + serializedBody.slice(span.end);
+ }
+ 
+ function requestHeaders(input: Parameters<FetchFunction>[0], init?: RequestInit): Headers {
 diff --git a/packages/ai/test/anthropic-claude-code.test.ts b/packages/ai/test/anthropic-claude-code.test.ts
-index d966ebd0..3bbbfb5b 100644
+index d966ebd0..8293d5f5 100644
 --- a/packages/ai/test/anthropic-claude-code.test.ts
 +++ b/packages/ai/test/anthropic-claude-code.test.ts
-@@ -72,4 +72,44 @@ describe("Claude Code Anthropic request compatibility", () => {
+@@ -52,6 +52,20 @@ describe("Claude Code Anthropic request compatibility", () => {
+ 		expect(patched.tools).toEqual(body.tools);
+ 	});
+ 
++	it("patches bytes in place without re-serializing formatting or escapes", () => {
++		const body = [
++			"{",
++			'  "model": "claude-opus-5",',
++			'  "messages": [{ "role": "user", "content": "h\\u0069" }],',
++			'  "system": [{ "type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.330.000; cc_entrypoint=sdk-cli; cch=00000;" }]',
++			"}",
++		].join("\n");
++		const patched = patchClaudeCodeCch(body);
++		expect(patched).toContain('"h\\u0069"');
++		expect(patched.replace(/cch=[0-9a-f]{5};/u, "cch=00000;")).toBe(body);
++		expect(JSON.parse(patched).system[0].text).toMatch(/cch=[0-9a-f]{5};$/u);
++	});
++
+ 	it("patches the final SDK body and generates a request UUID", async () => {
+ 		const body =
+ 			'{"model":"claude-opus-5","messages":[],"max_tokens":1,"stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.224.000; cc_entrypoint=sdk-cli; cch=00000;"}]}';
+@@ -72,4 +86,42 @@ describe("Claude Code Anthropic request compatibility", () => {
  		expect(headers.get("x-client-request-id")).toMatch(/^[0-9a-f-]{36}$/);
  		expect(headers.get("authorization")).toBe("Bearer secret");
  	});
 +
 +	it("matches native cch oracle values for tool and fallback bodies", () => {
-+		const billing =
-+			"x-anthropic-billing-header: cc_version=2.1.258.01c; cc_entrypoint=sdk-cli; cch=00000;";
-+		const billingCli =
-+			"x-anthropic-billing-header: cc_version=2.1.295.8a8; cc_entrypoint=cli; cch=00000;";
++		const billing = "x-anthropic-billing-header: cc_version=2.1.258.01c; cc_entrypoint=sdk-cli; cch=00000;";
++		const billingCli = "x-anthropic-billing-header: cc_version=2.1.295.8a8; cc_entrypoint=cli; cch=00000;";
 +		const sdk = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 +		const withTools = JSON.stringify({
 +			model: "claude-sonnet-4-5",

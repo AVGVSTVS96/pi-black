@@ -67,6 +67,32 @@ describe("Anthropic provider wrapper", () => {
 		expect(fake.getSimpleOptions()).toBe(options);
 	});
 
+	it("disables message continuity for OAuth requests", () => {
+		const fake = fakeProvider();
+		const wrapped = wrapAnthropicProvider(fake.provider, undefined);
+		wrapped.stream(model, context, { apiKey: "sk-ant-oat-test" });
+		expect(fake.getStreamOptions()?.disableContinuation).toBe(true);
+	});
+
+	it("cannot have continuity re-enabled by the caller", () => {
+		const fake = fakeProvider();
+		const wrapped = wrapAnthropicProvider(fake.provider, undefined);
+		wrapped.stream(model, context, {
+			apiKey: "sk-ant-oat-test",
+			disableContinuation: false,
+		});
+		expect(fake.getStreamOptions()?.disableContinuation).toBe(true);
+	});
+
+	it("leaves API-key stream options untouched", () => {
+		const fake = fakeProvider();
+		const wrapped = wrapAnthropicProvider(fake.provider, undefined);
+		const options: ApiStreamOptions<Api> = { apiKey: "sk-ant-api-key" };
+		wrapped.stream(model, context, options);
+		expect(fake.getStreamOptions()).toBe(options);
+		expect(fake.getStreamOptions()?.disableContinuation).toBeUndefined();
+	});
+
 	it("applies existing payload transforms before the final Pi Black transform", async () => {
 		const fake = fakeProvider();
 		const wrapped = wrapAnthropicProvider(fake.provider, {

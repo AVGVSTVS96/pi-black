@@ -36,35 +36,6 @@ function processEnvironment(): IdentityEnvironment {
 	return typeof process === "undefined" ? {} : process.env;
 }
 
-function hasNodeRuntime(): boolean {
-	return (
-		typeof process !== "undefined" &&
-		typeof process.versions?.node === "string"
-	);
-}
-
-/**
- * Node-only file discovery. The specifiers are built at runtime so a bundler
- * targeting a non-Node runtime cannot resolve them; `hasNodeRuntime()` keeps
- * this path unreachable there.
- */
-async function readClaudeConfig(
-	env: IdentityEnvironment,
-	configPath: string | undefined,
-): Promise<unknown> {
-	try {
-		const fs = await import(/* @vite-ignore */ ["node", "fs/promises"].join(":"));
-		const os = await import(/* @vite-ignore */ ["node", "os"].join(":"));
-		const path = await import(/* @vite-ignore */ ["node", "path"].join(":"));
-		const resolved =
-			configPath ??
-			path.join(env.CLAUDE_CONFIG_DIR || os.homedir(), ".claude.json");
-		return JSON.parse(await fs.readFile(resolved, "utf8"));
-	} catch {
-		return undefined;
-	}
-}
-
 interface JsonObject {
 	[key: string]: unknown;
 }
@@ -160,10 +131,36 @@ function firstUserPrompt(messages: Message[]): string {
 	for (const message of messages) {
 		if (message.role !== "user") continue;
 		if (typeof message.content === "string") return message.content;
-		return message.content
-			.filter((block) => block.type === "text")
-			.map((block) => block.text)
-			.join("");
+		return message.content.find((block) => block.type === "text")?.text ?? "";
+	}
+	return "";
+}
+
+/** The first user prompt as the request will carry it. */
+function userPromptFromPayload(payload: JsonObject): string {
+	const messages = payload.messages;
+	if (!Array.isArray(messages)) return "";
+	for (const message of messages) {
+		if (
+			!isObject(message) ||
+			message.role !== "user" ||
+			message.isMeta === true
+		) {
+			continue;
+		}
+		const content = message.content;
+		if (typeof content === "string") return content;
+		if (!Array.isArray(content)) return "";
+		for (const block of content) {
+			if (
+				isObject(block) &&
+				block.type === "text" &&
+				typeof block.text === "string"
+			) {
+				return block.text;
+			}
+		}
+		return "";
 	}
 	return "";
 }
@@ -174,10 +171,7 @@ function bytesToHex(bytes: Uint8Array): string {
 	);
 }
 
-export async function claudeCodeVersionFingerprint(
-	messages: Message[],
-): Promise<string> {
-	const prompt = firstUserPrompt(messages);
+async function fingerprintForPrompt(prompt: string): Promise<string> {
 	const selected = [4, 7, 20].map((index) => prompt[index] || "0").join("");
 	const input = new TextEncoder().encode(
 		`59cf53e54c78${selected}${CLAUDE_CODE_VERSION}`,
@@ -186,11 +180,21 @@ export async function claudeCodeVersionFingerprint(
 	return bytesToHex(new Uint8Array(digest)).slice(0, 3);
 }
 
+export async function claudeCodeVersionFingerprint(
+	messages: Message[],
+): Promise<string> {
+	return fingerprintForPrompt(firstUserPrompt(messages));
+}
+
+async function billingHeaderForPrompt(prompt: string): Promise<string> {
+	const fingerprint = await fingerprintForPrompt(prompt);
+	return `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.${fingerprint}; cc_entrypoint=${CLAUDE_CODE_ENTRYPOINT}; ${CCH_PLACEHOLDER};`;
+}
+
 export async function buildClaudeCodeBillingHeader(
 	messages: Message[],
 ): Promise<string> {
-	const fingerprint = await claudeCodeVersionFingerprint(messages);
-	return `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.${fingerprint}; cc_entrypoint=${CLAUDE_CODE_ENTRYPOINT}; ${CCH_PLACEHOLDER};`;
+	return billingHeaderForPrompt(firstUserPrompt(messages));
 }
 
 export function parseClaudeCodeIdentity(
@@ -217,25 +221,19 @@ export function parseClaudeCodeIdentity(
 
 export async function discoverClaudeCodeIdentity(
 	env: IdentityEnvironment = processEnvironment(),
-	configPath?: string,
 ): Promise<ClaudeCodeIdentity | undefined> {
 	const deviceId = env.CLAUDE_CODE_DEVICE_ID;
 	const accountUuid = env.CLAUDE_CODE_ACCOUNT_UUID;
-	if (deviceId && accountUuid) {
-		const fromEnvironment = parseClaudeCodeIdentity({
-			userID: deviceId,
-			oauthAccount: { accountUuid },
-		});
-		if (fromEnvironment) return fromEnvironment;
-	}
-
-	if (!hasNodeRuntime()) return undefined;
-	return parseClaudeCodeIdentity(await readClaudeConfig(env, configPath));
+	if (!deviceId || !accountUuid) return undefined;
+	return parseClaudeCodeIdentity({
+		userID: deviceId,
+		oauthAccount: { accountUuid },
+	});
 }
 
 export async function transformClaudeCodePayload(
 	payload: unknown,
-	context: TranscriptContext,
+	_context: TranscriptContext,
 	sessionId: string | undefined,
 	identity: ClaudeCodeIdentity | undefined,
 ): Promise<JsonObject> {
@@ -256,7 +254,9 @@ export async function transformClaudeCodePayload(
 			: firstSystemText === LEGACY_PI_OAUTH_SYSTEM_PROMPT
 				? existingSystem.slice(1)
 				: existingSystem;
-	const billingHeader = await buildClaudeCodeBillingHeader(context.messages);
+	const billingHeader = await billingHeaderForPrompt(
+		userPromptFromPayload(payload),
+	);
 	const transformed: JsonObject = {
 		...payload,
 		system: [
@@ -283,13 +283,20 @@ const CCH_EXCLUDED_KEYS = new Set([
 	'"fallback_credit_token"',
 ]);
 
-// Byte-level hash view matching the claude-code native engine (validated against
-// claude-code 2.1.220-2.1.295 wire samples): every "model" key whose value is a
-// string is emptied at any depth; max_tokens/fallbacks/fallback_credit_token
-// members are dropped from the view with the native comma rules (a trailing run
-// of two or more excluded members keeps the preceding comma). Everything else
-// stays byte-identical, so unusual escapes or number spellings never change the
-// hash.
+function isExcludedMember(key: string, firstValueCharacter: string): boolean {
+	if (!CCH_EXCLUDED_KEYS.has(key)) return false;
+	if (key === '"max_tokens"') return /[-0-9]/u.test(firstValueCharacter);
+	if (key === '"fallbacks"') return firstValueCharacter === "[";
+	return firstValueCharacter === '"';
+}
+
+// Byte-level hash view matching the claude-code native engine, validated against
+// 2.1.330 captures: every "model" string value is emptied at any depth; numeric
+// max_tokens, array fallbacks and string fallback_credit_token members are
+// dropped with the native comma rules (a trailing run of two or more excluded
+// members keeps the preceding comma). Object-valued members of the same name,
+// such as tool schema properties, stay in the view. Everything else is hashed as
+// serialized, and the patched request is spliced from the same bytes.
 function cchHashInput(body: string): string {
 	const edits: Array<{ start: number; end: number }> = [];
 	let pos = 0;
@@ -360,7 +367,7 @@ function cchHashInput(body: string): string {
 				throw new Error("Pi Black cch input is missing an object colon");
 			skipWhitespace();
 			const key = body.slice(keyStart, keyEnd);
-			const excluded = collect && CCH_EXCLUDED_KEYS.has(key);
+			const excluded = collect && isExcludedMember(key, body[pos] ?? "");
 			if (collect && key === '"model"' && body[pos] === "\"") {
 				const [valueStart, valueEnd] = parseString();
 				edits.push({ start: valueStart + 1, end: valueEnd - 1 });
@@ -425,6 +432,98 @@ function cchHashInput(body: string): string {
 	}
 	return normalized + body.slice(cursor);
 }
+function systemBillingTextSpan(
+	body: string,
+): { start: number; end: number } | undefined {
+	let pos = 0;
+	let found: { start: number; end: number } | undefined;
+	const skipWhitespace = () => {
+		while (pos < body.length && " \t\r\n".includes(body[pos] as string)) pos++;
+	};
+	const readString = (): { start: number; end: number } => {
+		const start = pos;
+		if (body[pos] !== '"')
+			throw new Error("Pi Black cch input expected an object key");
+		pos++;
+		while (pos < body.length) {
+			const ch = body[pos];
+			if (ch === "\\") {
+				pos += 2;
+				continue;
+			}
+			pos++;
+			if (ch === '"') return { start, end: pos };
+		}
+		throw new Error("Pi Black cch input has an unterminated string");
+	};
+	const readValue = (path: ReadonlyArray<string | number>): void => {
+		skipWhitespace();
+		const ch = body[pos];
+		if (ch === '"') {
+			const span = readString();
+			if (
+				path.length === 3 &&
+				path[0] === "system" &&
+				path[1] === 0 &&
+				path[2] === "text"
+			) {
+				found = span;
+			}
+			return;
+		}
+		if (ch === "{") {
+			pos++;
+			skipWhitespace();
+			if (body[pos] === "}") {
+				pos++;
+				return;
+			}
+			for (;;) {
+				skipWhitespace();
+				const keySpan = readString();
+				const key = JSON.parse(body.slice(keySpan.start, keySpan.end)) as string;
+				skipWhitespace();
+				if (body[pos] !== ":")
+					throw new Error("Pi Black cch input is missing an object colon");
+				pos++;
+				readValue([...path, key]);
+				skipWhitespace();
+				if (body[pos] === ",") {
+					pos++;
+					continue;
+				}
+				if (body[pos] !== "}")
+					throw new Error("Pi Black cch input is missing an object end");
+				pos++;
+				return;
+			}
+		}
+		if (ch === "[") {
+			pos++;
+			skipWhitespace();
+			if (body[pos] === "]") {
+				pos++;
+				return;
+			}
+			for (let index = 0; ; index++) {
+				readValue([...path, index]);
+				skipWhitespace();
+				if (body[pos] === ",") {
+					pos++;
+					continue;
+				}
+				if (body[pos] !== "]")
+					throw new Error("Pi Black cch input is missing an array end");
+				pos++;
+				return;
+			}
+		}
+		while (pos < body.length && !",}] \t\r\n".includes(body[pos] as string)) pos++;
+	};
+	readValue([]);
+	return found;
+}
+
 export function patchClaudeCodeCch(serializedBody: string): string {
 	let body: JsonObject;
 	try {
@@ -450,14 +549,31 @@ export function patchClaudeCodeCch(serializedBody: string): string {
 		throw new Error("Pi Black OAuth request has an invalid billing block");
 	}
 	if (!billingText.includes(CCH_PLACEHOLDER)) {
-		if (/; cch=[0-9a-f]{5};$/u.test(billingText)) return serializedBody;
+		if (/(?:^|[; ])cch=[0-9a-f]{5}(?=[; ]|$)/u.test(billingText))
+			return serializedBody;
 		throw new Error("Pi Black OAuth request has an invalid cch billing value");
 	}
 	const hashInput = cchHashInput(serializedBody);
 	const hash = xxHash64(new TextEncoder().encode(hashInput), CCH_SEED);
 	const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
-	body.system[0].text = billingText.replace(CCH_PLACEHOLDER, `cch=${cch}`);
-	return JSON.stringify(body);
+	// Splice into the original bytes: the server hashes what it receives, so
+	// formatting and escapes must survive.
+	const span = systemBillingTextSpan(serializedBody);
+	if (span === undefined)
+		throw new Error(
+			"Pi Black OAuth request billing block is not in the serialized body",
+		);
+	const serializedText = serializedBody.slice(span.start, span.end);
+	if (JSON.parse(serializedText) !== billingText)
+		throw new Error(
+			"Pi Black OAuth request billing block is not in the serialized body",
+		);
+	const patchedText = billingText.replace(CCH_PLACEHOLDER, `cch=${cch}`);
+	return (
+		serializedBody.slice(0, span.start) +
+		JSON.stringify(patchedText) +
+		serializedBody.slice(span.end)
+	);
 }
 
 function requestHeaders(
@@ -529,9 +645,9 @@ export function mergeClaudeCodeOptions<T extends StreamOptions>(
 	const transport = options.fetch ?? globalThis.fetch;
 	return {
 		...options,
-		// Pi 1.5+ continues Anthropic message threads by sending only the new
+		// Pi 1.6 continues Anthropic message threads by sending only the new
 		// messages without `system`/`tools`, which drops the billing block. Send
-		// every OAuth request in full instead; older Pi releases ignore this.
+		// every OAuth request in full instead.
 		disableContinuation: true,
 		headers: { ...options.headers, ...claudeCodeHeaders(options.sessionId) },
 		fetch: createClaudeCodeFetch(transport),

@@ -1,11 +1,15 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 import { patchClaudeCodeCch } from "../src/claude-code-protocol.ts";
 
-// cch values produced by the REAL claude-code 2.1.295 native engine (bun fork),
-// captured 2026-10-09 through the claude-harness / mitm hermetic chain.
-// Spec (reverse engineered): xxHash64 over JSON.stringify(body with model -> "" when
-// present, max_tokens removed when present, every tools[i].model -> "" when present),
-// seed 0x4d659218e32a3268, masked with 0xfffff, lowercased 5 hex chars.
+// cch values produced by the REAL claude-code native engine: 2.1.295 vectors
+// captured 2026-10-09, plus full 2.1.330 requests captured 2026-11-21 through a
+// local request-capturing proxy (test/fixtures).
+// Spec, confirmed against 2.1.330: xxHash64, seed 0x4d659218e32a3268, over the
+// serialized body with every "model" string emptied and numeric max_tokens,
+// array fallbacks and string fallback_credit_token members dropped, at any
+// depth; object-valued members of the same name stay. Masked with 0xfffff,
+// lowercased 5 hex chars.
 const BILLING_SDK = "x-anthropic-billing-header: cc_version=2.1.258.01c; cc_entrypoint=sdk-cli; cch=00000;";
 const BILLING_CLI = "x-anthropic-billing-header: cc_version=2.1.295.8a8; cc_entrypoint=cli; cch=00000;";
 const AGENT_SDK_SYSTEM_PROMPT = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
@@ -154,4 +158,37 @@ describe("patchClaudeCodeCch against native oracle values", () => {
       expect(system[0].text).toContain(`cch=${oracle.cch};`);
     });
   }
+});
+
+const CAPTURES: Array<{ file: string; cch: string; fingerprint: string }> = [
+  { file: "claude-code-2.1.330-oauth.json", cch: "e5c0b", fingerprint: "57a" },
+  { file: "claude-code-2.1.330-nested-schema.json", cch: "1756f", fingerprint: "57a" },
+];
+
+describe("captured Claude Code 2.1.330 requests", () => {
+  for (const capture of CAPTURES) {
+    test(capture.file, () => {
+      const raw = readFileSync(
+        new URL(`./fixtures/${capture.file}`, import.meta.url),
+        "utf8",
+      );
+      const header: string = JSON.parse(raw).system[0].text;
+      expect(header).toContain(`cc_version=2.1.330.${capture.fingerprint};`);
+      expect(header).toContain(`cch=${capture.cch};`);
+      const patched = JSON.parse(
+        patchClaudeCodeCch(raw.replace(`cch=${capture.cch}`, "cch=00000")),
+      );
+      expect(patched.system[0].text).toContain(`cch=${capture.cch};`);
+    });
+  }
+
+  test("keeps object-valued members that share an excluded name", () => {
+    const raw = readFileSync(
+      new URL("./fixtures/claude-code-2.1.330-nested-schema.json", import.meta.url),
+      "utf8",
+    );
+    expect(raw).toContain('"max_tokens":{"type":"number"}');
+    expect(raw).toContain('"fallbacks":{"type":"array"');
+    expect(raw).toContain('"fallback_credit_token":{"type":"string"}');
+  });
 });

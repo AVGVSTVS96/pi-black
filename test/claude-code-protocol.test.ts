@@ -14,6 +14,7 @@ import {
 	transformClaudeCodePayload,
 	xxHash64,
 } from "../src/claude-code-protocol.ts";
+import { discoverClaudeCodeIdentityInNode } from "../src/node-identity.ts";
 
 const encoder = new TextEncoder();
 const temporaryDirectories: string[] = [];
@@ -71,6 +72,93 @@ describe("Claude Code protocol", () => {
 		);
 	});
 
+	it("fingerprints the first text block of the payload's first user message", async () => {
+		const payload = await transformClaudeCodePayload(
+			{
+				model: "claude-opus-5",
+				max_tokens: 64000,
+				messages: [
+					{
+						role: "user",
+						content: [
+							{ type: "text", text: "Reply with " },
+							{ type: "image", source: { type: "base64", data: "" } },
+							{ type: "text", text: "exactly: ok" },
+						],
+					},
+				],
+				system: [],
+			},
+			context("a different prompt that was rewritten upstream"),
+			undefined,
+			undefined,
+		);
+		const system = payload.system as Array<Record<string, unknown>>;
+		expect(system[0]?.text).toBe(
+			`x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.05b; cc_entrypoint=sdk-cli; cch=00000;`,
+		);
+	});
+
+	it("does not fall back to the context transcript", async () => {
+		const payload = await transformClaudeCodePayload(
+			{ model: "claude-opus-5", max_tokens: 64000, messages: [], system: [] },
+			context("Reply with exactly: PROBE_OK"),
+			undefined,
+			undefined,
+		);
+		const system = payload.system as Array<Record<string, unknown>>;
+		expect(system[0]?.text).toBe(
+			`x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.d01; cc_entrypoint=sdk-cli; cch=00000;`,
+		);
+	});
+
+	it("patches the system block even when a message repeats the billing text", () => {
+		const billing = `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.000; cc_entrypoint=sdk-cli; cch=00000;`;
+		const body = JSON.stringify({
+			model: "claude-opus-5",
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: billing },
+						{ type: "text", text: "hi" },
+					],
+				},
+			],
+			system: [{ type: "text", text: billing }],
+		});
+		const parsed = JSON.parse(patchClaudeCodeCch(body));
+		expect(parsed.messages[0].content[0].text).toBe(billing);
+		expect(parsed.system[0].text).toMatch(/cch=[0-9a-f]{5};$/u);
+	});
+
+	it("accepts a billing block whose cch is followed by more fields", () => {
+		const body = JSON.stringify({
+			model: "claude-opus-5",
+			messages: [{ role: "user", content: "hi" }],
+			system: [
+				{
+					type: "text",
+					text: "x-anthropic-billing-header: cc_version=2.1.330.d01; cc_entrypoint=sdk-cli; cch=2f804; cc_turn_origin=sdk;",
+				},
+			],
+		});
+		expect(patchClaudeCodeCch(body)).toBe(body);
+	});
+
+	it("splices the cch without re-serializing formatting or escapes", () => {
+		const body = [
+			"{",
+			'  "model": "claude-opus-5",',
+			'  "messages": [{ "role": "user", "content": "h\\u0069" }],',
+			`  "system": [{ "type": "text", "text": "x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.000; cc_entrypoint=sdk-cli; cch=00000;" }]`,
+			"}",
+		].join("\n");
+		const patched = patchClaudeCodeCch(body);
+		expect(patched).toContain('"h\\u0069"');
+		expect(patched.replace(/cch=[0-9a-f]{5};/u, "cch=00000;")).toBe(body);
+	});
+
 	it("discovers and validates identity from Claude Code state without exposing it", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-black-"));
 		temporaryDirectories.push(root);
@@ -80,10 +168,32 @@ describe("Claude Code protocol", () => {
 			JSON.stringify({ userID: deviceId, oauthAccount: { accountUuid } }),
 		);
 
-		expect(await discoverClaudeCodeIdentity({}, path)).toEqual({
+		expect(await discoverClaudeCodeIdentityInNode({}, path)).toEqual({
 			deviceId,
 			accountUuid,
 		});
+		expect(
+			await discoverClaudeCodeIdentity({
+				CLAUDE_CODE_DEVICE_ID: deviceId,
+				CLAUDE_CODE_ACCOUNT_UUID: accountUuid,
+			}),
+		).toEqual({ deviceId, accountUuid });
+		// Environment values win over the file, and no file is read without them.
+		expect(
+			await discoverClaudeCodeIdentityInNode(
+				{
+					CLAUDE_CODE_DEVICE_ID: deviceId,
+					CLAUDE_CODE_ACCOUNT_UUID: accountUuid,
+				},
+				join(tmpdir(), "pi-black-missing.json"),
+			),
+		).toEqual({ deviceId, accountUuid });
+		expect(
+			await discoverClaudeCodeIdentityInNode(
+				{},
+				join(tmpdir(), "pi-black-missing.json"),
+			),
+		).toBeUndefined();
 		expect(
 			parseClaudeCodeIdentity({ userID: "bad", oauthAccount: { accountUuid } }),
 		).toBeUndefined();
@@ -93,7 +203,9 @@ describe("Claude Code protocol", () => {
 		const payload = await transformClaudeCodePayload(
 			{
 				model: "claude-opus-5",
-				messages: [],
+				messages: [
+					{ role: "user", content: "Reply with exactly: PROBE_OK" },
+				],
 				max_tokens: 64000,
 				stream: true,
 				system: [

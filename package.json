@@ -14,7 +14,8 @@
     "./provider": "./src/anthropic-provider.ts",
     "./oauth": "./src/anthropic-oauth.ts",
     "./protocol": "./src/claude-code-protocol.ts",
-    "./compatibility": "./src/compatibility.ts"
+    "./compatibility": "./src/compatibility.ts",
+    "./node-identity": "./src/node-identity.ts"
   },
   "pi": {
     "extensions": [

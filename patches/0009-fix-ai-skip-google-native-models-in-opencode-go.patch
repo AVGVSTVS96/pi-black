@@ -1,0 +1,26 @@
+From a0df0e207acdf95be3d44259a8f2ad8aeb3b1667 Mon Sep 17 00:00:00 2001
+From: Pi OAuth Compatibility Maintainers <noreply@example.invalid>
+Date: Sat, 21 Nov 2026 22:35:00 -0800
+Subject: [PATCH] fix(ai): skip Google-native models on OpenCode Go
+
+---
+ packages/ai/scripts/generate-models.ts | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/packages/ai/scripts/generate-models.ts b/packages/ai/scripts/generate-models.ts
+index afbd8d00..cd011c80 100644
+--- a/packages/ai/scripts/generate-models.ts
++++ b/packages/ai/scripts/generate-models.ts
+@@ -1870,6 +1870,9 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
+ 				// Switch them to openai-completions so requests use Bearer auth
+ 				// and the standard /v1/chat/completions endpoint.
+ 				if (variant.provider === "opencode-go") {
++					// OpenCode Go exposes Anthropic- and OpenAI-compatible endpoints only;
++					// a Google-native model cannot be represented by this provider's types.
++					if (api === "google-generative-ai") continue;
+ 					if (modelId === "minimax-m2.7") {
+ 						api = "openai-completions";
+ 						baseUrl = `${variant.basePath}/v1`;
+-- 
+2.56.1
+
