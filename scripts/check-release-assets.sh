@@ -20,6 +20,8 @@ expected=(
     0004-fix-ai-stabilize-Cloudflare-API-inference.patch
     0005-fix-ai-update-Claude-Code-protocol-to-2.1.280.patch
     0006-fix-ai-accept-renamed-Kimi-Coding-model-sources.patch
+    0007-fix-ai-update-Claude-Code-protocol-to-2.1.330.patch
+    0008-fix-ai-hash-the-native-cch-view-byte-for-byte.patch
     PI_BUILD_INPUTS.env
     BUILD.md
     PROVENANCE.txt

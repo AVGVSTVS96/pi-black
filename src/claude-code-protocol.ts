@@ -1,15 +1,12 @@
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type {
-	Context,
 	FetchFunction,
 	Message,
 	ProviderHeaders,
 	StreamOptions,
+	TranscriptContext,
 } from "@earendil-works/pi-ai";
 
-export const CLAUDE_CODE_VERSION = "2.1.280";
+export const CLAUDE_CODE_VERSION = "2.1.330";
 export const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
 
 const CCH_PLACEHOLDER = "cch=00000";
@@ -28,6 +25,44 @@ const LEGACY_PI_OAUTH_SYSTEM_PROMPT =
 export interface ClaudeCodeIdentity {
 	deviceId: string;
 	accountUuid: string;
+}
+
+/** Environment-shaped values; a Worker passes its bindings here. */
+export type IdentityEnvironment = Readonly<
+	Record<string, string | undefined>
+>;
+
+function processEnvironment(): IdentityEnvironment {
+	return typeof process === "undefined" ? {} : process.env;
+}
+
+function hasNodeRuntime(): boolean {
+	return (
+		typeof process !== "undefined" &&
+		typeof process.versions?.node === "string"
+	);
+}
+
+/**
+ * Node-only file discovery. The specifiers are built at runtime so a bundler
+ * targeting a non-Node runtime cannot resolve them; `hasNodeRuntime()` keeps
+ * this path unreachable there.
+ */
+async function readClaudeConfig(
+	env: IdentityEnvironment,
+	configPath: string | undefined,
+): Promise<unknown> {
+	try {
+		const fs = await import(/* @vite-ignore */ ["node", "fs/promises"].join(":"));
+		const os = await import(/* @vite-ignore */ ["node", "os"].join(":"));
+		const path = await import(/* @vite-ignore */ ["node", "path"].join(":"));
+		const resolved =
+			configPath ??
+			path.join(env.CLAUDE_CONFIG_DIR || os.homedir(), ".claude.json");
+		return JSON.parse(await fs.readFile(resolved, "utf8"));
+	} catch {
+		return undefined;
+	}
 }
 
 interface JsonObject {
@@ -181,7 +216,7 @@ export function parseClaudeCodeIdentity(
 }
 
 export async function discoverClaudeCodeIdentity(
-	env: NodeJS.ProcessEnv = process.env,
+	env: IdentityEnvironment = processEnvironment(),
 	configPath?: string,
 ): Promise<ClaudeCodeIdentity | undefined> {
 	const deviceId = env.CLAUDE_CODE_DEVICE_ID;
@@ -194,18 +229,13 @@ export async function discoverClaudeCodeIdentity(
 		if (fromEnvironment) return fromEnvironment;
 	}
 
-	const path =
-		configPath ?? join(env.CLAUDE_CONFIG_DIR || homedir(), ".claude.json");
-	try {
-		return parseClaudeCodeIdentity(JSON.parse(await readFile(path, "utf8")));
-	} catch {
-		return undefined;
-	}
+	if (!hasNodeRuntime()) return undefined;
+	return parseClaudeCodeIdentity(await readClaudeConfig(env, configPath));
 }
 
 export async function transformClaudeCodePayload(
 	payload: unknown,
-	context: Context,
+	context: TranscriptContext,
 	sessionId: string | undefined,
 	identity: ClaudeCodeIdentity | undefined,
 ): Promise<JsonObject> {
@@ -247,6 +277,154 @@ export async function transformClaudeCodePayload(
 	return transformed;
 }
 
+const CCH_EXCLUDED_KEYS = new Set([
+	'"max_tokens"',
+	'"fallbacks"',
+	'"fallback_credit_token"',
+]);
+
+// Byte-level hash view matching the claude-code native engine (validated against
+// claude-code 2.1.220-2.1.295 wire samples): every "model" key whose value is a
+// string is emptied at any depth; max_tokens/fallbacks/fallback_credit_token
+// members are dropped from the view with the native comma rules (a trailing run
+// of two or more excluded members keeps the preceding comma). Everything else
+// stays byte-identical, so unusual escapes or number spellings never change the
+// hash.
+function cchHashInput(body: string): string {
+	const edits: Array<{ start: number; end: number }> = [];
+	let pos = 0;
+	const skipWhitespace = () => {
+		while (pos < body.length && " \t\r\n".includes(body[pos])) pos++;
+	};
+	const consume = (character: string) => {
+		if (body[pos] === character) {
+			pos++;
+			return true;
+		}
+		return false;
+	};
+	const parseString = (): [number, number] => {
+		const start = pos;
+		pos++;
+		while (pos < body.length) {
+			if (body[pos] === "\\") pos += 2;
+			else if (body[pos] === "\"") {
+				pos++;
+				return [start, pos];
+			} else pos++;
+		}
+		throw new Error("Pi Black cch input has an unterminated JSON string");
+	};
+	const parseValue = (collect: boolean): void => {
+		skipWhitespace();
+		if (body[pos] === "{") return parseObject(collect);
+		if (body[pos] === "[") {
+			pos++;
+			skipWhitespace();
+			if (consume("]")) return;
+			for (;;) {
+				parseValue(collect);
+				skipWhitespace();
+				if (consume(",")) continue;
+				if (consume("]")) return;
+				throw new Error("Pi Black cch input has invalid array syntax");
+			}
+		}
+		if (body[pos] === "\"") {
+			parseString();
+			return;
+		}
+		const start = pos;
+		while (pos < body.length && !",}] \t\r\n".includes(body[pos])) pos++;
+		if (pos === start)
+			throw new Error("Pi Black cch input has an invalid JSON value");
+	};
+	function parseObject(collect: boolean): void {
+		pos++;
+		skipWhitespace();
+		if (consume("}")) return;
+		const members: Array<{
+			start: number;
+			end: number;
+			commaBefore: number;
+			commaAfter: number;
+			excluded: boolean;
+		}> = [];
+		let commaBefore = -1;
+		for (;;) {
+			skipWhitespace();
+			const memberStart = pos;
+			const [keyStart, keyEnd] = parseString();
+			skipWhitespace();
+			if (!consume(":"))
+				throw new Error("Pi Black cch input is missing an object colon");
+			skipWhitespace();
+			const key = body.slice(keyStart, keyEnd);
+			const excluded = collect && CCH_EXCLUDED_KEYS.has(key);
+			if (collect && key === '"model"' && body[pos] === "\"") {
+				const [valueStart, valueEnd] = parseString();
+				edits.push({ start: valueStart + 1, end: valueEnd - 1 });
+			} else parseValue(collect && !excluded);
+			const memberEnd = pos;
+			skipWhitespace();
+			let commaAfter = -1;
+			if (consume(",")) commaAfter = pos - 1;
+			members.push({
+				start: memberStart,
+				end: memberEnd,
+				commaBefore,
+				commaAfter,
+				excluded,
+			});
+			if (commaAfter >= 0) {
+				commaBefore = commaAfter;
+				continue;
+			}
+			if (!consume("}"))
+				throw new Error("Pi Black cch input is missing an object end");
+			break;
+		}
+		if (collect) {
+			let index = 0;
+			while (index < members.length) {
+				if (!members[index].excluded) {
+					index++;
+					continue;
+				}
+				let last = index;
+				while (last + 1 < members.length && members[last + 1].excluded)
+					last++;
+				if (last + 1 < members.length)
+					edits.push({
+						start: members[index].start,
+						end: members[last].commaAfter + 1,
+					});
+				else if (index > 0 && last > index)
+					edits.push({ start: members[index].start, end: members[last].end });
+				else if (index > 0)
+					edits.push({
+						start: members[index].commaBefore,
+						end: members[last].end,
+					});
+				else
+					edits.push({ start: members[index].start, end: members[last].end });
+				index = last + 1;
+			}
+		}
+	}
+	parseValue(true);
+	skipWhitespace();
+	if (pos !== body.length)
+		throw new Error("Pi Black cch input has trailing JSON data");
+	edits.sort((a, b) => a.start - b.start);
+	let normalized = "";
+	let cursor = 0;
+	for (const edit of edits) {
+		normalized += body.slice(cursor, edit.start);
+		cursor = edit.end;
+	}
+	return normalized + body.slice(cursor);
+}
 export function patchClaudeCodeCch(serializedBody: string): string {
 	let body: JsonObject;
 	try {
@@ -275,14 +453,7 @@ export function patchClaudeCodeCch(serializedBody: string): string {
 		if (/; cch=[0-9a-f]{5};$/u.test(billingText)) return serializedBody;
 		throw new Error("Pi Black OAuth request has an invalid cch billing value");
 	}
-	if (typeof body.model !== "string" || !("max_tokens" in body)) {
-		throw new Error("Pi Black OAuth request is missing model or max_tokens");
-	}
-
-	const normalized = structuredClone(body);
-	normalized.model = "";
-	delete normalized.max_tokens;
-	const hashInput = JSON.stringify(normalized);
+	const hashInput = cchHashInput(serializedBody);
 	const hash = xxHash64(new TextEncoder().encode(hashInput), CCH_SEED);
 	const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
 	body.system[0].text = billingText.replace(CCH_PLACEHOLDER, `cch=${cch}`);
@@ -348,7 +519,7 @@ export function isAnthropicOAuthToken(apiKey: string | undefined): boolean {
 
 export function mergeClaudeCodeOptions<T extends StreamOptions>(
 	options: T,
-	context: Context,
+	context: TranscriptContext,
 	identity:
 		| ClaudeCodeIdentity
 		| undefined
@@ -358,6 +529,10 @@ export function mergeClaudeCodeOptions<T extends StreamOptions>(
 	const transport = options.fetch ?? globalThis.fetch;
 	return {
 		...options,
+		// Pi 1.5+ continues Anthropic message threads by sending only the new
+		// messages without `system`/`tools`, which drops the billing block. Send
+		// every OAuth request in full instead; older Pi releases ignore this.
+		disableContinuation: true,
 		headers: { ...options.headers, ...claudeCodeHeaders(options.sessionId) },
 		fetch: createClaudeCodeFetch(transport),
 		onPayload: async (payload, model) => {

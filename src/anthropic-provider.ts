@@ -1,10 +1,10 @@
 import type {
 	Api,
 	ApiStreamOptions,
-	Context,
 	Model,
 	Provider,
 	SimpleStreamOptions,
+	TranscriptContext,
 } from "@earendil-works/pi-ai";
 import {
 	type ClaudeCodeIdentity,
@@ -27,7 +27,7 @@ export function wrapAnthropicProvider(
 		...provider,
 		stream<T extends Api>(
 			model: Model<T>,
-			context: Context,
+			context: TranscriptContext,
 			options?: ApiStreamOptions<T>,
 		) {
 			if (!options || !isAnthropicOAuthToken(options.apiKey))
@@ -37,7 +37,7 @@ export function wrapAnthropicProvider(
 		},
 		streamSimple(
 			model: Model<Api>,
-			context: Context,
+			context: TranscriptContext,
 			options?: SimpleStreamOptions,
 		) {
 			if (!options || !isAnthropicOAuthToken(options.apiKey))

@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Context, Message } from "@earendil-works/pi-ai";
+import { type Message, normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	buildClaudeCodeBillingHeader,
@@ -20,9 +20,8 @@ const temporaryDirectories: string[] = [];
 const promptMessages = (prompt: string): Message[] => [
 	{ role: "user", content: prompt, timestamp: 1 },
 ];
-const context = (prompt: string): Context => ({
-	messages: promptMessages(prompt),
-});
+const context = (prompt: string) =>
+	normalizeContext({ messages: promptMessages(prompt) });
 const deviceId = "f".repeat(64);
 const accountUuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
@@ -47,13 +46,28 @@ describe("Claude Code protocol", () => {
 			await claudeCodeVersionFingerprint(
 				promptMessages("Reply with exactly: PROBE_OK"),
 			),
-		).toBe("022");
+		).toBe("363");
 		expect(
 			await buildClaudeCodeBillingHeader(
 				promptMessages("Reply with exactly: PROBE_OK"),
 			),
 		).toBe(
-			`x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.022; cc_entrypoint=sdk-cli; cch=00000;`,
+			`x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.363; cc_entrypoint=sdk-cli; cch=00000;`,
+		);
+	});
+
+	it("matches a captured Claude Code 2.1.330 billing header", async () => {
+		expect(
+			await claudeCodeVersionFingerprint(
+				promptMessages("Reply with exactly: ok"),
+			),
+		).toBe("57a");
+		expect(
+			await buildClaudeCodeBillingHeader(
+				promptMessages("Reply with exactly: ok"),
+			),
+		).toBe(
+			`x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.57a; cc_entrypoint=sdk-cli; cch=00000;`,
 		);
 	});
 
@@ -101,7 +115,7 @@ describe("Claude Code protocol", () => {
 		const system = payload.system as Array<Record<string, unknown>>;
 		expect(system[0]).toEqual({
 			type: "text",
-			text: `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.022; cc_entrypoint=sdk-cli; cch=00000;`,
+			text: `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.363; cc_entrypoint=sdk-cli; cch=00000;`,
 		});
 		expect(system[1]).toEqual({
 			type: "text",
